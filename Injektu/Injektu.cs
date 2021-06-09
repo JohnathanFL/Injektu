@@ -11,15 +11,23 @@ namespace Injektu
 {
     /// <summary>
     /// Indicates that this property should be resolved via injection. <br />
-    /// Maps directly to either <see cref="Container.Resolve{TService}" /> or <see cref="Container.Resolve{TService}(string)" />, depending on
-    /// whether <see cref="InjectedAttribute.Name" /> has been set or not.
+    /// Feel free to subclass this and add more information to it. Container will scan for properties with attributes that
+    /// are simply *assignable* to this type.
     /// </summary>
-    [AttributeUsage(AttributeTargets.Property | AttributeTargets.Field)]
-    public class InjectedAttribute : Attribute
+    [AttributeUsage(AttributeTargets.Property)]
+    public class InjectAttribute : Attribute
     {
-        public string? Name { get; init; }
-
         public bool Required { get; init; } = true;
+    }
+
+    [AttributeUsage(AttributeTargets.Property)]
+    public class InjectByNameAttribute : InjectAttribute
+    {
+        /// <summary>
+        /// Must either be (in the case TKey == string) or parse out to (TKey.Parse(Key)) the key for this instance.
+        /// </summary>
+        /// <value></value>
+        public string? Key { get; init; }
     }
 
     // TODO
@@ -41,13 +49,28 @@ namespace Injektu
         Transient
     }
 
+    public record ContainerByType(string Name, Container<object, Type, InjectAttribute>? Parent) : ContainerByType<object>(Name, Parent);
+
+    public record ContainerByType<TBase>(string Name, Container<object, Type, InjectAttribute>? Parent) : Container<object, Type, InjectAttribute>(Name, Parent)
+    {
+        protected override Type GetKeyFromProperty(PropertyInfo prop) => prop.PropertyType;
+
+        public void Register<TService>(Expression<Func<TService>> ctor, ServiceScope scope) where TService : TBase => Register(typeof(TService), ctor, scope);
+
+        public TService? Resolve<TService>(bool required = true) where TService : class, TBase => Resolve(typeof(TService), required) as TService;
+    }
+
     /// <summary>
     /// A container
     /// </summary>
     /// <param name="Name">Name this scope. Literally only part of the spec because C# is stupid, and not having it would conflict with the copy constructor.</param>
     /// <param name="Parent"></param>
+    /// <param name="TBase">The required base class for all services</param>
+    /// <param name="TKey">The type used to identify keys</param>
     /// <returns></returns>
-    public record Container(string Name, Container? Parent)
+    public abstract record Container<TBase, TKey, TMarker>(string Name, Container<TBase, TKey, TMarker>? Parent)
+        where TKey : notnull
+        where TMarker : InjectAttribute
     {
         public bool Sealed { get; private set; } = Parent?.Sealed == true ? throw new InvalidOperationException("A ContainerScope's parent must be already sealed.") : false;
 
@@ -73,24 +96,13 @@ namespace Injektu
         /// Resolve a service by overarching type.
         /// </summary>
         /// <returns>Null if no service has been registered for this type.</returns>
-        public TService? Resolve<TService>(bool require = true) => Sealed 
-            ? TypeCreators.TryGetValue(typeof(TService), out var creator) 
-                ? (TService?)creator() 
-                : require 
-                    ? throw new InvalidOperationException($"Service {typeof(TService).Name} not registered with container {Name}") 
-                    : default 
+        public TBase? Resolve(TKey key, bool require = true) => Sealed
+            ? Creators.TryGetValue(key, out var creator)
+                ? creator()
+                : require
+                    ? throw new InvalidOperationException($"Service {key} not registered with container {Name}")
+                    : default
             : throw new InvalidProgramException("May only resolve after sealing.");
-
-        /// <summary>
-        /// Resolve a service purely by name. See <see cref="Register{TService}(Expression{Func{TService}}, ServiceScope, string?)" /> for more details.
-        /// </summary>
-        public TService? Resolve<TService>(string name, bool require = true) => Sealed 
-            ? NameCreators.TryGetValue(name, out var creator) 
-                ? (TService?)creator() 
-                : require 
-                    ? throw new InvalidOperationException($"Service {name} not found in context {Name}") 
-                    : default 
-            : throw new InvalidProgramException("May only resolve after sealing");
 
         /// <summary>
         /// Bind a constructor to a service type. Will overwrite any previously bound service on that TService.
@@ -98,38 +110,19 @@ namespace Injektu
         /// <param name="ctor"></param>
         /// <param name="scope"></param>
         /// <param name="name">If specified, will also bind this service to a name at the same time.</param>
-        public void RegisterByType<TService>(Expression<Func<TService>> ctor, ServiceScope scope, string? name = null)
+        public void Register<TService>(TKey key, Expression<Func<TService>> ctor, ServiceScope scope)
+            where TService : TBase
         {
             if (Sealed) throw new InvalidProgramException("May only register before sealing!");
 
             var t = typeof(TService);
 
-            var scopeParam = Expression.Parameter(typeof(Container), "scope");
+            var scopeParam = Expression.Parameter(typeof(Container<TBase, TKey, TMarker>), "scope");
             var retLbl = Expression.Label();
-            var innerCtor = Expression.Lambda(Expression.Call(scopeParam, ResolveOnInfo, new Expression[] { ctor.Body, Expression.Constant(t) }), new[] { scopeParam });
+            var innerCtor = Expression.Lambda<Func<Container<TBase, TKey, TMarker>, TBase>>(Expression.Call(scopeParam, ResolveOnInfo, new Expression[] { ctor.Body, Expression.Constant(t) }), new[] { scopeParam });
 
-            TypeScopes[t] = scope;
-            TypeCtors[t] = innerCtor;
-            if (name is not null)
-            {
-                ServiceNames[name] = t;
-                NameScopes[name] = scope;
-                NameCtors[name] = innerCtor;
-            }
-        }
-
-        /// <summary>
-        /// Bind a constructor to a service name. Identical to <see cref="Register{TService}(Expression{Func{TService}}, ServiceScope, string?)" /> except
-        /// that this method will not allow resolution by TService. All other semantics are identical to that function.
-        /// </summary>
-        public void RegisterByName<TObj>(Expression<Func<TObj>> ctor, string name, ServiceScope scope)
-        {
-            var t = typeof(TObj);
-
-            var scopeParam = Expression.Parameter(typeof(Container), "scope");
-            var retLbl = Expression.Label();
-            var innerCtor = Expression.Lambda(Expression.Call(scopeParam, ResolveOnInfo, new Expression[] { ctor.Body, Expression.Constant(t) }), false, new[] { scopeParam });
-            (NameScopes[name], NameCtors[name]) = (scope, innerCtor);
+            Scopes[key] = scope;
+            Ctors[key] = innerCtor;
         }
 
         /// <summary>
@@ -146,7 +139,9 @@ namespace Injektu
             CacheCreators();
         }
 
-        internal static MethodInfo ResolveOnInfo = typeof(Container).GetMethods().Single(m => m.Name == nameof(ResolveOn) && m.GetParameters().Length == 2);
+        protected abstract TKey GetKeyFromProperty(PropertyInfo prop);
+
+        internal static MethodInfo ResolveOnInfo = typeof(Container<TBase, TKey, TMarker>).GetMethods().Single(m => m.Name == nameof(ResolveOn) && m.GetParameters().Length == 2);
 
         internal Func<object, object> MakeResolver(Type t)
         {
@@ -154,36 +149,36 @@ namespace Injektu
             // to an object at the end.
 
             // The value we're placing the resolved values on.
-            var tgtParam = Expression.Parameter(typeof(object), "target");
+            var tgtParam = Expression.Parameter(typeof(TBase), "target");
             var stmts = new List<Expression>();
             var tgt = Expression.Variable(t, "tgt");
             stmts.Add(Expression.Assign(tgt, Expression.Convert(tgtParam, t)));
             // stmts.Add(Expression.Invoke(Expression.Constant((Action<object>)(_ => Console.WriteLine(new StackTrace()))), tgt));
-            var retLblTgt = Expression.Label(typeof(object));
+            var retLblTgt = Expression.Label(typeof(TBase));
             var retLbl = Expression.Label(retLblTgt, tgtParam);
-            foreach (var (prop, attrib) in t.GetProperties().Select(p => (p: p, a: p.GetCustomAttribute<InjectedAttribute>())).Where(pa => pa.a is not null))
+
+            // We inject any property marked `[Inject]` *or any other attribute descended from [Inject]*.
+            foreach (var prop in from prop in t.GetProperties() 
+                                 where prop.GetCustomAttribute<TMarker>() is not null 
+                                 select prop)
             {
                 Expression injected = null!;
-                void getInjected<TKey>(PropertyInfo prop, Type ty, TKey key, Dictionary<TKey, ServiceScope> scopes, Dictionary<TKey, Func<object>> trans, Dictionary<TKey, object> insts)
-                    where TKey : notnull
-                {
-
-                    if (!scopes.ContainsKey(key)) injected = Expression.Default(ty);
-                    else
-                    {
-                        // if (!trans.ContainsKey(key)) Console.WriteLine(new StackTrace());
-                        injected = scopes[key] switch
-                        {
-                            ServiceScope.Singleton or ServiceScope.Scoped => Expression.Constant(insts[key], ty),
-                            ServiceScope.Transient => Expression.Invoke(Expression.Constant(trans[key])),
-                            _ => throw new InvalidProgramException("This can never happen, Microsoft. Shut it."),
-                        };
-                    }
-                }
                 var ty = prop.PropertyType;
 
-                if (attrib.Name is not null) getInjected<string>(prop, ty, attrib.Name, NameScopes, NameTransients, NameInstances);
-                else getInjected<Type>(prop, ty, ty, TypeScopes, TypeTransients, TypeInstances);
+                var key = GetKeyFromProperty(prop);
+
+                if (!Scopes.ContainsKey(key)) injected = Expression.Default(ty);
+                else
+                {
+                    // if (!trans.ContainsKey(key)) Console.WriteLine(new StackTrace());
+                    injected = Scopes[key] switch
+                    {
+                        ServiceScope.Singleton or ServiceScope.Scoped => Expression.Constant(Instances[key], ty),
+                        ServiceScope.Transient => Expression.Invoke(Expression.Constant(Transients[key])),
+                        _ => throw new InvalidProgramException("This can never happen, Microsoft. Shut it."),
+                    };
+                }
+
 
                 stmts.Add(Expression.Assign(
                     Expression.PropertyOrField(tgt, prop.Name),
@@ -195,11 +190,11 @@ namespace Injektu
 
             stmts.Add(retLbl);
 
-            Console.WriteLine($"Made a resolver for {t}:");
-            foreach (var stmt in stmts)
-            {
-                Console.WriteLine("\t" + stmt);
-            }
+            // Console.WriteLine($"Made a resolver for {t}:");
+            // foreach (var stmt in stmts)
+            // {
+            //     Console.WriteLine("\t" + stmt);
+            // }
 
             var lambda = Expression.Lambda<Func<object, object>>(Expression.Block(new[] { tgt }, stmts), false, new[] { tgtParam });
 
@@ -208,41 +203,28 @@ namespace Injektu
 
         internal void CacheInstances()
         {
-            void cache<TKey>(Dictionary<TKey, ServiceScope> scopes, Dictionary<TKey, object>? parentInsts, Dictionary<TKey, LambdaExpression> ctors, Dictionary<TKey, object> insts)
-                where TKey : notnull
+            // Copy any singletons from the parent, if applicable. Scopes must be re-created.
+            if (Parent is not null)
+                foreach (var (key, inst) in Parent.Instances.Where(_ => Scopes[_.Key] == ServiceScope.Singleton))
+                    Instances[key] = inst;
+            foreach (var (key, ctor) in Ctors.Where(_ => Scopes[_.Key] != ServiceScope.Transient))
             {
-                // Copy any singletons from the parent, if applicable. Scopes must be re-created.
-                if (Parent is not null)
-                    foreach (var (key, inst) in parentInsts!.Where(_ => scopes[_.Key] == ServiceScope.Singleton))
-                        insts[key] = inst;
-                foreach (var (key, ctor) in ctors.Where(_ => scopes[_.Key] != ServiceScope.Transient))
-                {
-                    Console.WriteLine($"Caching instance for {key} which is a {scopes[key]}");
-                    var inst = ctor.Compile()?.DynamicInvoke(this);
-                    if (inst is null) throw new InvalidProgramException($"Provided a null-constructor for {key} with scope {scopes[key]}");
+                // Console.WriteLine($"Caching instance for {key} which is a {scopes[key]}");
+                var inst = ctor.Compile().Invoke(this);
+                if (inst is null) throw new InvalidProgramException($"Provided a null-constructor for {key} with scope {Scopes[key]}");
 
-                    insts[key] = inst;
-                }
+                Instances[key] = inst;
             }
-
-            cache<Type>(TypeScopes, Parent?.TypeInstances, TypeCtors, TypeInstances);
-            cache<string>(NameScopes, Parent?.NameInstances, NameCtors, NameInstances);
         }
 
         internal void CacheTransients()
         {
-            void doCache<TKey>(Dictionary<TKey, ServiceScope> scopes, Dictionary<TKey, LambdaExpression> ctors, Dictionary<TKey, Func<object>> transients) where TKey : notnull
+            foreach (var (key, ctor) in Ctors.Where(_ => Scopes[_.Key] == ServiceScope.Transient))
             {
-                foreach (var (key, ctor) in ctors.Where(_ => scopes[_.Key] == ServiceScope.Transient))
-                {
-                    var method = (Func<Container, object>)ctor.Compile();
-                    transients[key] = () => method(this);
-                    Console.WriteLine($"Added transient {key}");
-                }
+                var method = (Func<Container<TBase, TKey, TMarker>, TBase>)ctor.Compile();
+                Transients[key] = () => method(this);
+                // Console.WriteLine($"Added transient {key}");
             }
-
-            doCache<string>(NameScopes, NameCtors, NameTransients);
-            doCache<Type>(TypeScopes, TypeCtors, TypeTransients);
         }
 
         /// <summary>
@@ -250,55 +232,35 @@ namespace Injektu
         /// </summary>
         internal void CacheCreators()
         {
-            void doCached<TKey>(Dictionary<TKey, ServiceScope> scopes, Dictionary<TKey, LambdaExpression> ctors, Dictionary<TKey, object> insts, Dictionary<TKey, Func<object>> creators) where TKey : notnull
+            foreach (var (key, ctor) in Ctors.Where(_ => Scopes[_.Key] == ServiceScope.Transient))
             {
-                foreach (var (key, ctor) in ctors.Where(_ => scopes[_.Key] == ServiceScope.Transient))
-                {
-                    var lambda = Expression.Lambda<Func<object>>(Expression.Invoke(ctor, Expression.Constant(this)));
-                    var func = lambda.Compile();
-                    // creators[key] = () => { Console.WriteLine($"Doing creator for transient {key}"); return func(); };
-                    creators[key] = func;
-                    // Console.WriteLine($"Cached creator for {key}: {lambda}");
-                }
-
-                foreach (var (key, inst) in insts)
-                    // creators[key] = () => { Console.WriteLine($"Doing instance for {key}"); return inst; };
-                    creators[key] = () => inst;
-
+                var lambda = Expression.Lambda<Func<TBase>>(Expression.Invoke(ctor, Expression.Constant(this)));
+                var func = lambda.Compile();
+                // creators[key] = () => { Console.WriteLine($"Doing creator for transient {key}"); return func(); };
+                Creators[key] = func;
+                // Console.WriteLine($"Cached creator for {key}: {lambda}");
             }
-            doCached<string>(NameScopes, NameCtors, NameInstances, NameCreators);
-            doCached<Type>(TypeScopes, TypeCtors, TypeInstances, TypeCreators);
+
+            foreach (var (key, inst) in Instances)
+                // creators[key] = () => { Console.WriteLine($"Doing instance for {key}"); return inst; };
+                Creators[key] = () => inst;
+
         }
 
 
-        internal readonly Dictionary<Type, ServiceScope> TypeScopes = Parent?.TypeScopes.CloneDictionary() ?? new();
+        internal readonly Dictionary<TKey, ServiceScope> Scopes = Parent?.Scopes.CloneDictionary() ?? new();
 
-        internal readonly Dictionary<string, ServiceScope> NameScopes = Parent?.NameScopes.CloneDictionary() ?? new();
+        internal readonly Dictionary<TKey, Expression<Func<Container<TBase, TKey, TMarker>, TBase>>> Ctors = Parent?.Ctors.CloneDictionary() ?? new();
 
-        /// <summary>
-        /// When a service is registered by both type and name, we use this table to maintain that relationship so
-        /// that resolution by both type and name return the same instance for singletons/scopees.
-        /// 
-        /// TODO
-        /// </summary>
-        internal readonly Dictionary<string, Type> ServiceNames = Parent?.ServiceNames.CloneDictionary() ?? new();
+        // ==============================================================================================
+        // | Anything above this line is fair game for copying to a new instance (and should be copied) |
+        // ==============================================================================================
 
-        internal readonly Dictionary<Type, LambdaExpression> TypeCtors = Parent?.TypeCtors.CloneDictionary() ?? new();
+        internal readonly Dictionary<TKey, TBase> Instances = new();
 
-        internal readonly Dictionary<string, LambdaExpression> NameCtors = Parent?.NameCtors.CloneDictionary() ?? new();
+        internal readonly Dictionary<TKey, Func<TBase>> Transients = new();
 
-        // =====================================================================================
-        // |Anything above this line is fair game for copying to a new instance (and should be)|
-        // =====================================================================================
-
-        internal readonly Dictionary<Type, object> TypeInstances = new();
-        internal readonly Dictionary<string, object> NameInstances = new();
-
-        internal readonly Dictionary<Type, Func<object>> TypeTransients = new();
-        internal readonly Dictionary<string, Func<object>> NameTransients = new();
-
-        internal readonly Dictionary<Type, Func<object>> TypeCreators = new();
-        internal readonly Dictionary<string, Func<object>> NameCreators = new();
+        internal readonly Dictionary<TKey, Func<TBase>> Creators = new();
 
         /// <summary>
         /// Baked functions that assign relevant services to their appropriate properties.

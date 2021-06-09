@@ -23,22 +23,22 @@ namespace Injektu.Test
             public static int InstanceCount = 0;
             public int InstanceNum;
 
-            [Injected]
+            [Inject]
             public Bar Bar { get; set; } = null;
 
             public Foo()
             {
                 InstanceNum = InstanceCount++;
-                Console.WriteLine("Called Foo's ctor");
+                // Console.WriteLine("Called Foo's ctor");
             }
         }
 
         [Fact]
-        public void Basic()
+        public void Test_ContainerByType()
         {
-            var cont = new Container("root", null);
-            cont.RegisterByType<Foo>(() => new(), ServiceScope.Singleton);
-            cont.RegisterByType<Bar>(() => new(), ServiceScope.Transient);
+            var cont = new ContainerByType("root", null);
+            cont.Register<Foo>(() => new(), ServiceScope.Singleton);
+            cont.Register<Bar>(() => new(), ServiceScope.Transient);
 
             // Assert.Throws<InvalidProgramException>(() => cont.Resolve<Foo>());
 
